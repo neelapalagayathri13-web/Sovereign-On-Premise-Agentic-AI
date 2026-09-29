@@ -1,0 +1,1081 @@
+/**
+ * Completion Controller
+ *
+ * Handles POST /api/chats/:id/completion
+ *
+ * Accepts the request format sent by @ai-sdk/react DefaultChatTransport:
+ *   {
+ *     model: string,
+ *     systemPromptId: string,
+ *     messages: Array<{ id, role, content, fileIds }>,
+ *     webSearch: boolean,
+ *     memoryEnabled: boolean
+ *   }
+ *
+ * Multi-Turn Architecture:
+ *   1. Verifies chat ownership for req.userId.
+ *   2. Persists incoming user message into MongoDB (preventing duplicates via ID upsert).
+ *   3. Loads the chat's persistent message history from MongoDB for chatId.
+ *   4. Supplies the complete conversation context to the selected model.
+ *   5. Streams the assistant response as SSE (AI SDK v6 UI Message Stream protocol).
+ *   6. Upon stream completion, persists ONE complete assistant message with the model name to MongoDB.
+ *   7. Updates Chat.updatedAt and auto-titles if necessary.
+ */
+
+import fs from "fs";
+import crypto from "crypto";
+import mongoose from "mongoose";
+import Chat from "../models/Chat.js";
+import Message from "../models/Message.js";
+import File from "../models/File.js";
+import {
+  streamChatFromOllama,
+  getActiveModel,
+  switchModel,
+  isOllamaReachable,
+  getInstalledModels,
+} from "../services/ollama.service.js";
+import { streamChatFromGemini } from "../services/gemini.service.js";
+import { isValidModelId, isCloudModelId, isMultimodalModel } from "../constants/models.config.js";
+import {
+  isIndexableDocument,
+  processAndIndexDocument,
+  retrieveChatContext,
+  buildAugmentedMessages,
+} from "../services/rag.service.js";
+import { countPointsForChat } from "../services/qdrant.service.js";
+import { routeMessage } from "../services/ragRouter.service.js";
+import {
+  retrieveKnowledgeBaseContext,
+  getKnowledgeBaseDocuments,
+  getKnowledgeBaseDocumentNames,
+} from "../services/knowledgeBase.service.js";
+import { buildAugmentedKnowledgeBaseMessages } from "../services/contextBuilder.service.js";
+
+/** Serialize one UI-message-stream chunk as an SSE data line. */
+function sseChunk(part) {
+  return `data: ${JSON.stringify(part)}\n\n`;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Convert internal messages to Ollama format.
+ * Ollama expects: [{ role, content, images?: string[] }]
+ *
+ * CRITICAL MULTIMODAL RULE:
+ * - Only models with multimodal capabilities (e.g. qwen2.5vl:7b) may receive the `images` field.
+ * - For text-only models (e.g. qwen3:8b, qwen2.5-coder:7b), the `images` field MUST be completely absent.
+ * - Textual conversation history is fully preserved.
+ */
+export function toOllamaMessages(messages, targetModel = null) {
+  const allowMultimodal = isMultimodalModel(targetModel);
+
+  return (messages || []).map(({ role, content, images }) => {
+    const msg = {
+      role,
+      content: (content || "").replace(/<think>[\s\S]*?<\/think>/g, "").trim(),
+    };
+    if (allowMultimodal && Array.isArray(images) && images.length > 0) {
+      msg.images = images;
+    }
+    return msg;
+  });
+}
+
+/**
+ * Set SSE response headers and flush.
+ */
+function beginSseStream(res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Vercel-AI-UI-Message-Stream", "v1");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+}
+
+// ── Gemini streaming ─────────────────────────────────────────────────────────
+
+/**
+ * Stream chat through Gemini 3.6 Flash and persist response to MongoDB.
+ */
+async function streamGeminiCompletion(res, messages, chatId, targetModel, ragSources = []) {
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      error: "Gemini is not configured. Add GEMINI_API_KEY to backend/.env",
+    });
+  }
+
+  beginSseStream(res);
+
+  const messageId = crypto.randomUUID();
+  res.write(sseChunk({ type: "start", messageId }));
+  res.write(sseChunk({ type: "start-step" }));
+  res.write(sseChunk({ type: "text-start", id: "text-1" }));
+
+  let aborted = false;
+  let finishReason = "stop";
+  let fullResponseText = "";
+
+  res.on("close", () => {
+    if (!res.writableEnded) aborted = true;
+  });
+
+  console.log(`[CHAT] Using model: ${targetModel}`);
+  console.log(`[CHAT] Streaming started (Gemini)`);
+
+  try {
+    for await (const delta of streamChatFromGemini(messages)) {
+      if (aborted) break;
+      if (delta) {
+        fullResponseText += delta;
+        res.write(sseChunk({ type: "text-delta", id: "text-1", delta }));
+      }
+    }
+  } catch (err) {
+    if (!aborted) {
+      console.error(`[completion.controller] Gemini stream error for chat ${chatId}:`, err.message);
+      res.write(sseChunk({ type: "error", errorText: err.message }));
+    }
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  res.write(sseChunk({ type: "text-end", id: "text-1" }));
+  res.write(sseChunk({ type: "finish-step" }));
+  res.write(sseChunk({ type: "finish", finishReason }));
+  res.write("data: [DONE]\n\n");
+  res.end();
+
+  console.log(`[CHAT] Streaming completed (Gemini)`);
+
+  // Persist ONE complete assistant message in MongoDB
+  if (!aborted && fullResponseText.trim()) {
+    try {
+      const parts = [{ type: "text", text: fullResponseText }];
+      if (Array.isArray(ragSources) && ragSources.length > 0) {
+        for (const s of ragSources) {
+          parts.push({
+            type: "source",
+            isDocument: true,
+            filename: s.filename,
+            page: s.page,
+            documentId: s.documentId,
+          });
+        }
+      }
+
+      await Message.findOneAndUpdate(
+        { _id: messageId, chatId },
+        {
+          $set: {
+            chatId,
+            role: "assistant",
+            content: fullResponseText,
+            parts,
+            model: targetModel,
+            metadata: ragSources?.length > 0 ? { ragSources } : null,
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+
+      await Chat.updateOne(
+        { _id: chatId },
+        { $set: { updatedAt: new Date(), selectedModel: targetModel } }
+      );
+    } catch (saveErr) {
+      console.error("[completion.controller] Failed to persist Gemini assistant message:", saveErr.message);
+    }
+  }
+}
+
+// ── Ollama streaming ──────────────────────────────────────────────────────────
+
+/**
+ * Stream chat through local Ollama model and persist response to MongoDB.
+ */
+async function streamOllamaCompletion(
+  res,
+  messages,
+  targetModel,
+  chatId,
+  ragSources = [],
+  options = {}
+) {
+  const { messageId = crypto.randomUUID(), sseStarted = false } = options;
+
+  // Check Ollama reachability
+  const reachable = await isOllamaReachable();
+  if (!reachable) {
+    if (sseStarted) {
+      res.write(sseChunk({ type: "error", errorText: "Ollama is not running. Please start Ollama manually." }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    return res.status(503).json({
+      success: false,
+      error: "Ollama is not running. Please start Ollama manually.",
+    });
+  }
+
+  // Validate model
+  if (!isValidModelId(targetModel)) {
+    if (sseStarted) {
+      res.write(sseChunk({ type: "error", errorText: "Selected model is not available locally." }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    return res.status(400).json({
+      success: false,
+      error: "Selected model is not available locally.",
+    });
+  }
+
+  // Check if model exists locally in Ollama
+  const installedModels = await getInstalledModels();
+  const isInstalled = installedModels.some(
+    (name) => name === targetModel || name.startsWith(targetModel.split(":")[0])
+  );
+  if (installedModels.length > 0 && !isInstalled) {
+    if (sseStarted) {
+      res.write(sseChunk({ type: "error", errorText: "Selected model is not available locally." }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    return res.status(400).json({
+      success: false,
+      error: "Selected model is not available locally.",
+    });
+  }
+
+  // Lazy Load: Ensure ONLY target model is loaded in RAM
+  try {
+    await switchModel(targetModel);
+  } catch (err) {
+    console.error(`[completion.controller] Failed to ensure model ${targetModel}:`, err.message);
+    const isConnErr =
+      err.message.includes("reach Ollama") ||
+      err.message.includes("fetch failed") ||
+      err.message.includes("not running");
+    const errMsg = isConnErr
+      ? "Ollama is not running. Please start Ollama manually."
+      : "Selected model is not available locally.";
+    if (sseStarted) {
+      res.write(sseChunk({ type: "error", errorText: errMsg }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    return res.status(isConnErr ? 503 : 400).json({
+      success: false,
+      error: errMsg,
+    });
+  }
+
+  if (!sseStarted) {
+    beginSseStream(res);
+    res.write(sseChunk({ type: "start", messageId }));
+    res.write(sseChunk({ type: "start-step" }));
+  }
+
+  res.write(sseChunk({ type: "text-start", id: "text-1" }));
+
+  const ollamaMessages = toOllamaMessages(messages, targetModel);
+  let finishReason = "stop";
+  let aborted = false;
+  let inThinking = false;
+  let fullResponseText = "";
+
+  res.on("close", () => {
+    if (!res.writableEnded) aborted = true;
+  });
+
+  console.log(`[CHAT] Using model: ${targetModel}`);
+  console.log(`[CHAT] Streaming started`);
+
+  try {
+    const { stream: ollamaStream } = await streamChatFromOllama(
+      ollamaMessages,
+      null,
+      targetModel
+    );
+
+    const reader = ollamaStream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      if (aborted) {
+        reader.cancel().catch(() => {});
+        break;
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        if (aborted) break;
+
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        let chunk;
+        try {
+          chunk = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
+
+        // Handle thinking tokens (reasoning models like qwen3)
+        const thinkingDelta = chunk?.message?.thinking;
+        if (thinkingDelta) {
+          if (!inThinking) {
+            inThinking = true;
+            res.write(sseChunk({ type: "text-delta", id: "text-1", delta: "<think>\n" }));
+            fullResponseText += "<think>\n";
+          }
+          fullResponseText += thinkingDelta;
+          res.write(sseChunk({ type: "text-delta", id: "text-1", delta: thinkingDelta }));
+        }
+
+        // Handle actual response content
+        const contentDelta = chunk?.message?.content;
+        if (contentDelta) {
+          if (inThinking) {
+            inThinking = false;
+            res.write(sseChunk({ type: "text-delta", id: "text-1", delta: "\n</think>\n\n" }));
+            fullResponseText += "\n</think>\n\n";
+          }
+          fullResponseText += contentDelta;
+          res.write(sseChunk({ type: "text-delta", id: "text-1", delta: contentDelta }));
+        }
+
+        // Handle stream completion
+        if (chunk?.done === true) {
+          if (inThinking) {
+            inThinking = false;
+            res.write(sseChunk({ type: "text-delta", id: "text-1", delta: "\n</think>\n\n" }));
+            fullResponseText += "\n</think>\n\n";
+          }
+          const doneReason = chunk?.done_reason || "stop";
+          finishReason = doneReason === "stop" ? "stop" : "other";
+        }
+      }
+    }
+
+    // Flush any remaining buffer line
+    if (buffer.trim() && !aborted) {
+      try {
+        const chunk = JSON.parse(buffer.trim());
+        const contentDelta = chunk?.message?.content;
+        if (contentDelta) {
+          if (inThinking) {
+            inThinking = false;
+            res.write(sseChunk({ type: "text-delta", id: "text-1", delta: "\n</think>\n\n" }));
+            fullResponseText += "\n</think>\n\n";
+          }
+          fullResponseText += contentDelta;
+          res.write(sseChunk({ type: "text-delta", id: "text-1", delta: contentDelta }));
+        }
+      } catch {
+        // Ignore incomplete final fragment
+      }
+    }
+  } catch (err) {
+    if (!aborted) {
+      console.error(`[completion.controller] Stream error for chat ${chatId}:`, err.message);
+      res.write(sseChunk({ type: "error", errorText: err.message }));
+    }
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  // Close thinking block if still open
+  if (inThinking) {
+    res.write(sseChunk({ type: "text-delta", id: "text-1", delta: "\n</think>\n\n" }));
+    fullResponseText += "\n</think>\n\n";
+  }
+
+  res.write(sseChunk({ type: "text-end", id: "text-1" }));
+  res.write(sseChunk({ type: "finish-step" }));
+  res.write(sseChunk({ type: "finish", finishReason }));
+  res.write("data: [DONE]\n\n");
+  res.end();
+
+  console.log(`[CHAT] Streaming completed`);
+
+  // Persist ONE complete assistant message in MongoDB
+  if (!aborted && fullResponseText.trim()) {
+    try {
+      const parts = [{ type: "text", text: fullResponseText }];
+      if (Array.isArray(ragSources) && ragSources.length > 0) {
+        for (const s of ragSources) {
+          parts.push({
+            type: "source",
+            isDocument: true,
+            filename: s.filename,
+            page: s.page,
+            documentId: s.documentId,
+          });
+        }
+      }
+
+      await Message.findOneAndUpdate(
+        { _id: messageId, chatId },
+        {
+          $set: {
+            chatId,
+            role: "assistant",
+            content: fullResponseText,
+            parts,
+            model: targetModel,
+            metadata: ragSources?.length > 0 ? { ragSources } : null,
+            createdAt: new Date(),
+          },
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+
+      await Chat.updateOne(
+        { _id: chatId },
+        { $set: { updatedAt: new Date(), selectedModel: targetModel } }
+      );
+    } catch (saveErr) {
+      console.error("[completion.controller] Failed to persist Ollama assistant message:", saveErr.message);
+    }
+  }
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
+/**
+ * POST /api/chats/:id/completion
+ */
+export async function postCompletion(req, res) {
+  const { id: chatId } = req.params;
+  const { messages, model: requestedModel } = req.body;
+  const userId = req.userId;
+
+  // Validate request
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({
+      success: false,
+      error: "Request must include a non-empty 'messages' array.",
+    });
+  }
+
+  const incomingUserMsg = messages[messages.length - 1];
+  const attachedFileIds = (incomingUserMsg?.fileIds || []).filter(Boolean);
+
+  // 1. Inspect incoming attached files
+  let attachedFiles = [];
+  if (attachedFileIds.length > 0) {
+    try {
+      attachedFiles = await File.find({ _id: { $in: attachedFileIds } });
+    } catch (e) {
+      console.warn("[completion.controller] Failed to fetch attached files:", e.message);
+    }
+  }
+
+  const hasIncomingImage = attachedFiles.some(
+    (f) => f.category === "image" || f.mimeType?.startsWith("image/")
+  );
+  const hasIncomingDocument = attachedFiles.some(
+    (f) =>
+      isIndexableDocument(f.filename, f.mimeType) ||
+      f.category === "pdf" ||
+      f.category === "textLike" ||
+      f.mimeType === "application/pdf"
+  );
+
+  // Ensure any attached document files are linked to this chatId
+  if (attachedFiles.length > 0) {
+    for (const f of attachedFiles) {
+      let needsSave = false;
+      if (!f.chatId || f.chatId !== chatId) {
+        f.chatId = chatId;
+        f.scope = "chat";
+        needsSave = true;
+      }
+      if (needsSave) {
+        await f.save().catch(() => {});
+      }
+    }
+  }
+
+  // 2. Check if current chat has any uploaded or indexed documents
+  let existingChatDocsCount = 0;
+  let qdrantPointCount = 0;
+  try {
+    existingChatDocsCount = await File.countDocuments({
+      chatId,
+      scope: "chat",
+      category: { $ne: "image" },
+    });
+    qdrantPointCount = await countPointsForChat(chatId);
+  } catch (e) {
+    console.warn("[completion.controller] Error checking chat document count:", e.message);
+  }
+
+  const hasChatDocuments = hasIncomingDocument || existingChatDocsCount > 0 || qdrantPointCount > 0;
+
+  // 3. Determine base model
+  let targetModel;
+  if (hasIncomingImage) {
+    targetModel = "qwen2.5vl:7b";
+    console.log(`[CHAT] Image attachment detected. Enforcing vision model: ${targetModel}`);
+  } else {
+    targetModel =
+      requestedModel && isValidModelId(requestedModel)
+        ? requestedModel
+        : requestedModel || getActiveModel() || "qwen3:8b";
+  }
+
+  // 4. Verify / ensure chat document exists in MongoDB for this user
+  let chat = await Chat.findOne({ _id: chatId, userId });
+  if (!chat) {
+    chat = await Chat.create({
+      _id: chatId,
+      userId,
+      title: "New Chat",
+      selectedModel: targetModel,
+    });
+  }
+
+  // 5. Save incoming user message to MongoDB to ensure persistence
+  if (incomingUserMsg && incomingUserMsg.role === "user") {
+    const userMsgId = incomingUserMsg.id || new mongoose.Types.ObjectId().toString();
+    await Message.findOneAndUpdate(
+      { _id: userMsgId, chatId },
+      {
+        $set: {
+          chatId,
+          role: "user",
+          content: incomingUserMsg.content || "",
+          parts: incomingUserMsg.parts || [{ type: "text", text: incomingUserMsg.content || "" }],
+          fileIds: incomingUserMsg.fileIds || [],
+          model: targetModel,
+          createdAt: incomingUserMsg.createdAt ? new Date(incomingUserMsg.createdAt) : new Date(),
+        },
+      },
+      { upsert: true, returnDocument: "after" }
+    );
+
+    // Auto-update chat title from first message if still "New Chat"
+    if (chat.title === "New Chat" && incomingUserMsg.content && incomingUserMsg.content.trim()) {
+      chat.title = incomingUserMsg.content.trim().slice(0, 30);
+      await chat.save().catch(() => {});
+    }
+  }
+
+  // 6. Load conversation history from MongoDB for this chatId ONLY
+  const dbMessages = await Message.find({ chatId }).sort({ createdAt: 1 }).lean();
+
+  // Load any associated image files to provide base64 to multimodal models
+  const allFileIds = [...new Set(dbMessages.flatMap((m) => m.fileIds || []).filter(Boolean))];
+  const imageFilesMap = new Map();
+  if (allFileIds.length > 0) {
+    const fileDocs = await File.find({ _id: { $in: allFileIds } }).lean();
+    for (const f of fileDocs) {
+      if (f.category === "image" || f.mimeType?.startsWith("image/")) {
+        imageFilesMap.set(f._id.toString(), f);
+      }
+    }
+  }
+
+  const conversationContext = dbMessages.map((m) => {
+    const item = {
+      role: m.role,
+      content: m.content || "",
+    };
+
+    if (m.role === "user" && Array.isArray(m.fileIds) && m.fileIds.length > 0) {
+      const images = [];
+      for (const fId of m.fileIds) {
+        const fileDoc = imageFilesMap.get(fId.toString());
+        if (fileDoc && fileDoc.path && fs.existsSync(fileDoc.path)) {
+          try {
+            const base64Data = fs.readFileSync(fileDoc.path).toString("base64");
+            images.push(base64Data);
+          } catch (readErr) {
+            console.error(`[completion.controller] Failed to read image ${fId} from disk:`, readErr.message);
+          }
+        }
+      }
+      if (images.length > 0) {
+        item.images = images;
+      }
+    }
+
+    return item;
+  });
+
+  // 7. RAG Router Decision
+  const userQuery = incomingUserMsg?.content || "";
+  const requestMode = req.body.mode || req.headers["x-chat-mode"] || "normal";
+  const previousHistory = dbMessages.slice(0, -1);
+  const workspaceId = req.headers["x-workspace-id"] || req.workspaceId || "default";
+
+  // Fetch Knowledge Base documents for router matching
+  const kbDocuments = await getKnowledgeBaseDocuments(workspaceId);
+  const kbDocumentNames = kbDocuments.map((d) => d.filename);
+  const hasKnowledgeBaseDocuments = kbDocuments.length > 0;
+
+  const routeDecision = routeMessage({
+    message: userQuery,
+    mode: requestMode,
+    conversationHistory: previousHistory,
+    hasChatDocuments,
+    attachedFiles,
+    hasKnowledgeBaseDocuments,
+    knowledgeBaseDocuments: kbDocuments,
+    knowledgeBaseDocumentNames: kbDocumentNames,
+  });
+
+  const effectiveRoute = routeDecision.route || (routeDecision.useRag ? "CHAT_DOCUMENT" : "GENERAL");
+
+  console.log(
+    `[RAG_ROUTER] Chat ${chatId} decision: route=${effectiveRoute}, mode=${routeDecision.retrievalMode || "N/A"}, targetDoc=${routeDecision.targetFilename || "none"}, reason=${routeDecision.reason}`
+  );
+
+  // ── GENERAL QUESTION PATH ────────────────────────────────────────────────
+  // If route === "GENERAL" (or useRag === false):
+  // - Bypasses nomic-embed-text completely (zero embedding calls).
+  // - Bypasses Qdrant completely (zero vector searches).
+  // - Does not emit any RAG status indicators.
+  // - Routes directly to Qwen3 (or Gemini if requested for a pure general chat).
+  if (effectiveRoute === "GENERAL" || !routeDecision.useRag) {
+    // Sanitize conversationContext to avoid context leakage from previous KB or tool turns
+    const isolatedContext = conversationContext.map((m) => {
+      if (m.role === "assistant" && typeof m.content === "string") {
+        const cleanContent = m.content.replace(/\n\nSources:\s*[\s\S]*$/i, "").trim();
+        return { ...m, content: cleanContent || m.content };
+      }
+      return m;
+    });
+
+    if (isCloudModelId(targetModel) && !hasChatDocuments && !hasIncomingImage) {
+      return streamGeminiCompletion(res, isolatedContext, chatId, targetModel, []);
+    }
+
+    return streamOllamaCompletion(res, isolatedContext, targetModel, chatId, []);
+  }
+
+  // ── KNOWLEDGE BASE QUESTION PATH ─────────────────────────────────────────
+  if (effectiveRoute === "KNOWLEDGE_BASE") {
+    const cleanKbQuery =
+      typeof routeDecision.cleanedQuery === "string"
+        ? routeDecision.cleanedQuery
+        : userQuery.replace(/^\/knowledgebase(?::|\s+|$)/i, "").trim();
+
+    return handleKnowledgeBaseCompletion({
+      res,
+      userQuery: cleanKbQuery,
+      conversationContext,
+      chatId,
+      userId,
+      workspaceId,
+      retrievalMode: routeDecision.retrievalMode,
+      targetDocumentId: routeDecision.targetDocumentId,
+      targetFilename: routeDecision.targetFilename,
+      targetModel: "qwen3:8b",
+      isEmptyCommand:
+        routeDecision.isEmptyCommand ||
+        (/^\/knowledgebase(?::|\s+|$)/i.test(userQuery.trim()) && !cleanKbQuery),
+    });
+  }
+
+  // ── CHAT DOCUMENT QUESTION PATH ──────────────────────────────────────────
+  return handleRagCompletion({
+    res,
+    userQuery,
+    conversationContext,
+    chatId,
+    userId,
+    attachedFiles,
+    targetModel: "qwen3:8b",
+  });
+}
+
+// ── Chat RAG Handler ─────────────────────────────────────────────────────────
+
+async function handleRagCompletion({
+  res,
+  userQuery,
+  conversationContext,
+  chatId,
+  userId,
+  attachedFiles = [],
+  targetModel = "qwen3:8b",
+}) {
+  const reachable = await isOllamaReachable();
+  if (!reachable) {
+    return res.status(503).json({
+      success: false,
+      error: "Ollama is not running. Please start Ollama manually.",
+    });
+  }
+
+  // Begin SSE stream
+  beginSseStream(res);
+  const messageId = crypto.randomUUID();
+  res.write(sseChunk({ type: "start", messageId }));
+  res.write(sseChunk({ type: "start-step" }));
+
+  // Status Indicator 1: "Searching PDF for context..."
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: { state: "RAG_SEARCHING", text: "Searching PDF for context..." },
+    })
+  );
+
+  // Small delay so the user can visibly see the searching status pill
+  await sleep(400);
+
+  // Index newly attached documents if needed
+  if (attachedFiles.length > 0) {
+    for (const f of attachedFiles) {
+      if (f.status !== "indexed" && isIndexableDocument(f.filename, f.mimeType)) {
+        console.log(`[completion.controller] Indexing attached document: ${f.filename}`);
+        await processAndIndexDocument(f).catch((e) => {
+          console.error(`[completion.controller] Indexing attached file ${f._id} error:`, e.message);
+        });
+      }
+    }
+  }
+
+  // Status Indicator 2: "Reading relevant sections from PDF..."
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: { state: "RAG_READING", text: "Reading relevant sections from PDF..." },
+    })
+  );
+
+  // Retrieve relevant chunks with strict chat-scoped isolation
+  const ragResult = await retrieveChatContext({
+    query: userQuery.trim(),
+    chatId,
+    userId,
+    limit: 15,
+    scoreThreshold: 0.35,
+  });
+
+  // Small delay so the reading phase is clearly visible to the user
+  await sleep(400);
+
+  // If Qdrant is unavailable: return concise document retrieval error without crashing
+  if (ragResult.qdrantUnavailable) {
+    const errMsg = "Document retrieval is currently unavailable because the vector database is offline. Please ensure Qdrant is running.";
+    res.write(sseChunk({ type: "data-rag-status", id: "rag-status", data: { state: "GENERATING" } }));
+    res.write(sseChunk({ type: "text-start", id: "text-1" }));
+    res.write(sseChunk({ type: "text-delta", id: "text-1", delta: errMsg }));
+    res.write(sseChunk({ type: "text-end", id: "text-1" }));
+    res.write(sseChunk({ type: "finish-step" }));
+    res.write(sseChunk({ type: "finish", finishReason: "stop" }));
+    res.write("data: [DONE]\n\n");
+    res.end();
+
+    await Message.findOneAndUpdate(
+      { _id: messageId, chatId },
+      {
+        $set: {
+          chatId,
+          role: "assistant",
+          content: errMsg,
+          parts: [{ type: "text", text: errMsg }],
+          model: targetModel,
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true, returnDocument: "after" }
+    ).catch(() => {});
+    return;
+  }
+
+  // If no sufficiently relevant chunks found: fall back to normal Qwen generation without document context
+  if (ragResult.noRelevantChunks || !ragResult.hasContext) {
+    console.log(
+      `[completion.controller] No relevant document chunks found for query in chat ${chatId}. Falling back to normal Qwen completion.`
+    );
+    res.write(
+      sseChunk({
+        type: "data-rag-status",
+        id: "rag-status",
+        data: { state: "GENERATING" },
+      })
+    );
+
+    return streamOllamaCompletion(
+      res,
+      conversationContext,
+      targetModel,
+      chatId,
+      [],
+      { messageId, sseStarted: true }
+    );
+  }
+
+  // Transition RAG indicator to GENERATING
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: { state: "GENERATING" },
+    })
+  );
+
+  // Emit live sources event over SSE so frontend receives them immediately
+  if (ragResult.sources?.length > 0) {
+    res.write(
+      sseChunk({
+        type: "data-rag-sources",
+        id: "rag-sources",
+        data: { sources: ragResult.sources },
+      })
+    );
+  }
+
+  // Augment conversation context with retrieved document sections and sources
+  const finalContext = buildAugmentedMessages(
+    conversationContext,
+    ragResult.contextText,
+    ragResult.sources
+  );
+
+  // Stream Ollama completion
+  return streamOllamaCompletion(
+    res,
+    finalContext,
+    targetModel,
+    chatId,
+    ragResult.sources,
+    { messageId, sseStarted: true }
+  );
+}
+
+// ── Knowledge Base RAG Handler ───────────────────────────────────────────────
+
+async function handleKnowledgeBaseCompletion({
+  res,
+  userQuery,
+  conversationContext,
+  chatId,
+  userId,
+  workspaceId = "default",
+  retrievalMode = "GLOBAL",
+  targetDocumentId = null,
+  targetFilename = null,
+  targetModel = "qwen3:8b",
+  isEmptyCommand = false,
+}) {
+  // Handle empty /knowledgebase slash command: return "Please provide a question."
+  if (isEmptyCommand || !userQuery || !userQuery.trim()) {
+    beginSseStream(res);
+    const messageId = crypto.randomUUID();
+    res.write(sseChunk({ type: "start", messageId }));
+    res.write(sseChunk({ type: "start-step" }));
+    res.write(sseChunk({ type: "text-start", id: "text-1" }));
+    const emptyPromptMsg = "Please provide a question.";
+    res.write(sseChunk({ type: "text-delta", id: "text-1", delta: emptyPromptMsg }));
+    res.write(sseChunk({ type: "text-end", id: "text-1" }));
+    res.write(sseChunk({ type: "finish-step" }));
+    res.write(sseChunk({ type: "finish", finishReason: "stop" }));
+    res.write("data: [DONE]\n\n");
+    res.end();
+
+    await Message.findOneAndUpdate(
+      { _id: messageId, chatId },
+      {
+        $set: {
+          chatId,
+          role: "assistant",
+          content: emptyPromptMsg,
+          parts: [{ type: "text", text: emptyPromptMsg }],
+          model: targetModel,
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true, returnDocument: "after" }
+    ).catch(() => {});
+    return;
+  }
+
+  const reachable = await isOllamaReachable();
+  if (!reachable) {
+    return res.status(503).json({
+      success: false,
+      error: "Ollama is not running. Please start Ollama manually.",
+    });
+  }
+
+  // Begin SSE stream
+  beginSseStream(res);
+  const messageId = crypto.randomUUID();
+  res.write(sseChunk({ type: "start", messageId }));
+  res.write(sseChunk({ type: "start-step" }));
+
+  // Status Indicator 1: "Searching Knowledge Base..."
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: {
+        state: "RAG_SEARCHING",
+        text: targetFilename
+          ? `Searching ${targetFilename}...`
+          : "Searching Knowledge Base...",
+      },
+    })
+  );
+
+  await sleep(400);
+
+  // Status Indicator 2: "Reading relevant sections..."
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: { state: "RAG_READING", text: "Reading relevant sections..." },
+    })
+  );
+
+  // Retrieve Knowledge Base context
+  const kbResult = await retrieveKnowledgeBaseContext({
+    query: userQuery.trim(),
+    documentId: targetDocumentId || null,
+    workspaceId,
+    userId,
+    limit: 8,
+    scoreThreshold: 0.35,
+  });
+
+  // Debug logging per requirements
+  console.log(`\n[KB Retrieval]`);
+  console.log(`Query: ${userQuery.trim()}`);
+  console.log(`Candidates: ${kbResult.candidatesCount || 0}`);
+  console.log(`After relevance filtering: ${kbResult.contextChunksCount || 0}`);
+  console.log(`Selected sources:`);
+  if (!kbResult.sources || kbResult.sources.length === 0) {
+    console.log(`  (none)`);
+  } else {
+    kbResult.sources.forEach((s) => {
+      const pageStr = s.pageText || (s.page ? `Page ${s.page}` : "Page N/A");
+      const scoreStr = typeof s.score === "number" ? s.score.toFixed(4) : "N/A";
+      console.log(`- ${s.filename} | ${pageStr} | score: ${scoreStr}`);
+    });
+  }
+  console.log(`[KB] Query: ${userQuery.trim()}`);
+  console.log(`[KB] Retrieved chunks: ${kbResult.candidatesCount || 0}`);
+  console.log(`[KB] Retrieved documents:\n${(kbResult.retrievedDocNames || []).map((d) => `    ${d}`).join("\n") || "    (none)"}`);
+  console.log(`[KB] Source documents after deduplication:\n${(kbResult.sources || []).map((s) => `    ${s.filename}`).join("\n") || "    (none)"}\n`);
+
+  console.log(
+    `[KB_RAG] Query="${userQuery.slice(0, 40)}" | Route=KNOWLEDGE_BASE | Mode=${retrievalMode || (targetDocumentId ? "DOCUMENT_SPECIFIC" : "GLOBAL")} | Document=${targetFilename || "ALL"} (${targetDocumentId || "none"}) | Filter={scope:"knowledge_base",docId:${targetDocumentId ? `"${targetDocumentId}"` : "null"}} | Candidates=${kbResult.candidatesCount || 0} | ContextChunks=${kbResult.contextChunksCount || 0} | Sources=${kbResult.sources?.length || 0}`
+  );
+
+  await sleep(400);
+
+  // Ensure conversation context uses clean query without /knowledgebase prefix
+  const cleanedConversationContext = (conversationContext || []).map((msg, idx) => {
+    if (idx === (conversationContext || []).length - 1 && msg.role === "user") {
+      return {
+        ...msg,
+        content: userQuery.trim(),
+      };
+    }
+    return msg;
+  });
+
+  // If no sufficiently relevant chunks found, or vector DB is unavailable:
+  // Fallback gracefully to the general model's internal knowledge!
+  // - Clearly tell the user that no sufficiently relevant Knowledge Base information was found.
+  // - Provide general model answer.
+  // - DO NOT attach fake or unrelated Knowledge Base citations (sources = []).
+  if (kbResult.noRelevantChunks || !kbResult.hasContext || !kbResult.contextText?.trim() || kbResult.qdrantUnavailable) {
+    console.log(
+      `[completion.controller] KB fallback to general model knowledge for query in workspace ${workspaceId}: "${userQuery.slice(0, 40)}"`
+    );
+
+    // Transition RAG status to GENERATING
+    res.write(
+      sseChunk({
+        type: "data-rag-status",
+        id: "rag-status",
+        data: { state: "GENERATING" },
+      })
+    );
+
+    const fallbackMessages = [
+      {
+        role: "system",
+        content:
+          "No sufficiently relevant documents were found in the Knowledge Base for this query. Clearly inform the user that no sufficiently relevant Knowledge Base information was found, and then answer their question based on general knowledge. Do not cite or fabricate any Knowledge Base sources.",
+      },
+      ...cleanedConversationContext.filter((m) => m.role !== "system"),
+    ];
+
+    return streamOllamaCompletion(
+      res,
+      fallbackMessages,
+      targetModel,
+      chatId,
+      [], // zero sources! No fake citations!
+      { messageId, sseStarted: true }
+    );
+  }
+
+  // Transition RAG indicator to GENERATING
+  res.write(
+    sseChunk({
+      type: "data-rag-status",
+      id: "rag-status",
+      data: { state: "GENERATING" },
+    })
+  );
+
+  // Emit live sources event over SSE
+  if (kbResult.sources?.length > 0) {
+    res.write(
+      sseChunk({
+        type: "data-rag-sources",
+        id: "rag-sources",
+        data: { sources: kbResult.sources },
+      })
+    );
+  }
+
+  // Augment conversation context with Knowledge Base context
+  const finalContext = buildAugmentedKnowledgeBaseMessages(
+    cleanedConversationContext,
+    kbResult.contextText,
+    kbResult.sources
+  );
+
+  // Stream Ollama completion
+  return streamOllamaCompletion(
+    res,
+    finalContext,
+    targetModel,
+    chatId,
+    kbResult.sources,
+    { messageId, sseStarted: true }
+  );
+}
